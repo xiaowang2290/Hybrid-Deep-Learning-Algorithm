@@ -1,0 +1,400 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import warnings
+import os
+warnings.filterwarnings("ignore")
+plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
+
+torch.set_default_dtype(torch.float64)
+
+
+# ===================== 1) 4D Hyperchaotic ODE =====================
+def ode_rhs(t, s, a=36.0, b=3.0, c=20.0, d=1.0):
+    x, y, z, w = s
+    dx = a * (y - x) + w
+    dy = (c - a) * x - x * z + c * y
+    dz = x * y - b * z
+    dw = x * z - d * w
+    return np.array([dx, dy, dz, dw], dtype=np.float64)
+
+
+# ===================== 2) RK4 one-step (vector) =====================
+def rk4_step_vec(ti, si, h, a, b, c, d):
+    k1 = ode_rhs(ti, si, a, b, c, d)
+    k2 = ode_rhs(ti + 0.5 * h, si + 0.5 * h * k1, a, b, c, d)
+    k3 = ode_rhs(ti + 0.5 * h, si + 0.5 * h * k2, a, b, c, d)
+    k4 = ode_rhs(ti + h, si + h * k3, a, b, c, d)
+    s_rk4 = si + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+    return s_rk4, (k1, k2, k3, k4)
+
+
+# ===================== 3) Correction net =====================
+class RK4CorrectionNet(nn.Module):
+    def __init__(self, input_dim=23, hidden_dim=256, depth=4, out_dim=4):
+        super().__init__()
+        layers = [nn.Linear(input_dim, hidden_dim), nn.GELU()]
+        for _ in range(depth - 1):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
+        layers += [nn.Linear(hidden_dim, out_dim)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ===================== 4) Trainer: fit A Posteriori Error =====================
+class Trainer:
+    def __init__(self, a=36.0, b=3.0, c=20.0, d=1.0, h=1e-2, t_max=1.0, device=None, seed=42):
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+        self.a, self.b, self.c, self.d = float(a), float(b), float(c), float(d)
+        self.h, self.t_max = float(h), float(t_max)
+        self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
+
+        # 确保模型也是 float64
+        self.model = RK4CorrectionNet(input_dim=23, hidden_dim=256, depth=4, out_dim=4).to(self.device).double()
+        self.mean = None
+        self.std = None
+
+    def _make_one_step_dataset(self, s0_list):
+        h = self.h
+        t_grid = np.arange(0.0, self.t_max + 1e-15, h)
+
+        inputs, targets = [], []
+
+        for s0 in s0_list:
+            S_traj = np.zeros((len(t_grid), 4), dtype=np.float64)
+            S_traj[0] = s0
+
+            for i in range(len(t_grid) - 1):
+                ti = t_grid[i]
+                si = S_traj[i]
+
+                # 1. 步长为 h 的大步
+                s_h, (k1, k2, k3, k4) = rk4_step_vec(ti, si, h, self.a, self.b, self.c, self.d)
+                S_traj[i + 1] = s_h
+
+                # 2. 步长为 h/2 的小步
+                s_half_1, _ = rk4_step_vec(ti, si, h / 2, self.a, self.b, self.c, self.d)
+                s_h2, _ = rk4_step_vec(ti + h / 2, s_half_1, h / 2, self.a, self.b, self.c, self.d)
+                e_est = (s_h2 - s_h) * (16.0/  15.0)
+
+                scale_factor = h ** 5
+                target_val = e_est / scale_factor
+
+                feat = np.concatenate(
+                    [
+                        np.array([ti, ti + h], dtype=np.float64),
+                        si.astype(np.float64),
+                        k1.astype(np.float64),
+                        k2.astype(np.float64),
+                        k3.astype(np.float64),
+                        k4.astype(np.float64),
+                        np.array([h], dtype=np.float64),
+                    ],
+                    axis=0,
+                )
+
+                inputs.append(feat)
+                targets.append(target_val.astype(np.float64))
+
+        X = np.stack(inputs, axis=0)
+        Y = np.stack(targets, axis=0)
+
+        mean = X.mean(axis=0, keepdims=True)
+        std = X.std(axis=0, keepdims=True)
+        std[std == 0] = 1.0
+
+        self.mean = torch.tensor(mean, dtype=torch.float64, device=self.device)
+        self.std = torch.tensor(std, dtype=torch.float64, device=self.device)
+
+        X_t = torch.tensor(X, dtype=torch.float64, device=self.device)
+        Y_t = torch.tensor(Y, dtype=torch.float64, device=self.device)
+        Xn = (X_t - self.mean) / self.std
+        return Xn, Y_t
+
+    def train(self, epochs=3000, lr=5e-4):
+        base = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float64)
+        s0_list = [
+            base,
+            base * 0.5,
+            base * 1.5,
+            base + np.array([0.2, -0.1, 0.1, -0.2]),
+            base + np.array([-0.3, 0.2, -0.2, 0.3]),
+        ]
+
+        Xn, Y = self._make_one_step_dataset(s0_list)
+
+        opt = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-6)
+        sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+        loss_fn = nn.MSELoss()
+
+        self.model.train()
+        for ep in range(1, epochs + 1):
+            opt.zero_grad(set_to_none=True)
+            pred = self.model(Xn)
+            loss = loss_fn(pred, Y)
+            loss.backward()
+            opt.step()
+            sched.step()
+
+            if ep == 1 or ep % 300 == 0:
+                print(f"Epoch {ep:5d} | Loss: {loss.item():.3e}")
+        return self
+
+    @torch.no_grad()
+    def predict_N(self, feat_23):
+        self.model.eval()
+        feat = torch.tensor(feat_23, dtype=torch.float64, device=self.device).view(1, -1)
+        feat_n = (feat - self.mean) / self.std
+        out = self.model(feat_n).cpu().numpy().reshape(-1)
+        return out
+    def save_model(self, path):
+        ckpt = {
+            "model_state": self.model.state_dict(),
+            "mean": self.mean,
+            "std": self.std,
+            "a": self.a, "b": self.b, "c": self.c, "d": self.d,
+            "h": self.h, "t_max": self.t_max,
+        }
+        torch.save(ckpt, path)
+
+    def load_model(self, path):
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state"])
+        self.mean = ckpt["mean"].to(self.device)
+        self.std = ckpt["std"].to(self.device)
+        self.model.eval()
+
+        # 可选：做一致性检查（强烈建议）
+        for k in ["a", "b", "c", "d", "h"]:
+            if k in ckpt:
+                v_now = getattr(self, k)
+                v_old = ckpt[k]
+                if abs(float(v_now) - float(v_old)) > 1e-12:
+                    print(f"[WARN] checkpoint {k}={v_old} but current {k}={v_now}. "
+                          f"Mismatch may break correction performance.")
+
+    def has_normalizer(self):
+        return (self.mean is not None) and (self.std is not None)
+
+# ===================== 5) Simulation =====================
+def simulate_rk4_plain(a, b, c, d, s0, t_final, h):
+    t_grid = np.arange(0.0, t_final + 1e-15, h)
+    S = np.zeros((len(t_grid), 4), dtype=np.float64)
+    S[0] = np.array(s0, dtype=np.float64)
+
+    for i in range(len(t_grid) - 1):
+        S[i + 1], _ = rk4_step_vec(t_grid[i], S[i], h, a, b, c, d)
+    return t_grid, S
+
+
+def simulate_corrected(trainer, s0, t_final):
+    """ 融合神经网络直接补偿的 RK4 """
+    a, b, c, d, h = trainer.a, trainer.b, trainer.c, trainer.d, trainer.h
+    t_grid = np.arange(0.0, t_final + 1e-15, h)
+    S = np.zeros((len(t_grid), 4), dtype=np.float64)
+    S[0] = np.array(s0, dtype=np.float64)
+
+    for i in range(len(t_grid) - 1):
+        ti = t_grid[i]
+        si = S[i]
+
+        s_rk4, (k1, k2, k3, k4) = rk4_step_vec(ti, si, h, a, b, c, d)
+
+        feat = np.concatenate(
+            [
+                np.array([ti, ti + h], dtype=np.float64),
+                si.astype(np.float64),
+                k1.astype(np.float64),
+                k2.astype(np.float64),
+                k3.astype(np.float64),
+                k4.astype(np.float64),
+                np.array([h], dtype=np.float64),
+            ],
+            axis=0,
+        )
+        # N_out 预测的是直接的误差估计值
+
+        N_out = trainer.predict_N(feat)
+        S[i + 1] = s_rk4 + N_out * (h ** 5)
+
+    return t_grid, S
+
+
+def reference_on_grid(a, b, c, d, s0, t_final, h):
+    sol = solve_ivp(
+        lambda t, s: ode_rhs(t, s, a, b, c, d),
+        (0.0, t_final),
+        y0=np.array(s0, dtype=np.float64),
+        method="DOP853",
+        rtol=1e-12,
+        atol=1e-12,
+        dense_output=True,
+    )
+    t_grid = np.arange(0.0, t_final + 1e-15, h)
+    S_ref = sol.sol(t_grid).T
+    return t_grid, S_ref
+
+
+# ===================== 6) Plot helpers =====================
+def plot_state_series(t, S_ref, S_rk4, S_prk4, prefix="hyper4d"):
+    names = ["x", "y", "z", "w"]
+    plt.figure(figsize=(14, 10))
+    for i in range(4):
+        plt.subplot(2, 2, i + 1)
+        #plt.plot(t, S_rk4[:, i], "g--", lw=2.0, label="True")
+        plt.plot(t, S_prk4[:, i], "r--", lw=1.5, label="PRK4")
+        plt.title(f"{names[i]}(t)")
+        plt.xlabel("t")
+        plt.ylabel(names[i])
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+    plt.tight_layout()
+    out = f"{prefix}_states.png"
+    plt.savefig(out, dpi=300)
+    print(f"Saved: {out}")
+
+
+def plot_error_series(t, E_rk4, E_prk4, prefix="hyper4d"):
+    names = ["x", "y", "z", "w"]
+    plt.figure(figsize=(14, 10))
+    for i in range(4):
+        plt.subplot(2, 2, i + 1)
+        plt.semilogy(t, E_rk4[:, i] + 1e-30, "g-", lw=1.5, label="|RK4-True|")
+        plt.semilogy(t, E_prk4[:, i] + 1e-30, "r-", lw=1.5, label="|PRK4-True|")
+        plt.title(f"Abs Error: {names[i]}")
+        plt.xlabel("t")
+        plt.ylabel("abs error (log)")
+        plt.grid(True, which="both", alpha=0.3)
+        plt.legend()
+    plt.tight_layout()
+    out = f"{prefix}_abs_error.png"
+    plt.savefig(out, dpi=300)
+    print(f"Saved: {out}")
+
+
+def plot_global_error(t, E_rk4, E_prk4, prefix="hyper4d"):
+    def running_rmse(E):
+        sq = (E ** 2).mean(axis=1)
+        cumsum = np.cumsum(sq)
+        n = np.arange(1, len(t) + 1)
+        return np.sqrt(cumsum / n)
+
+    rmse_rk4 = running_rmse(E_rk4)
+    rmse_prk4 = running_rmse(E_prk4)
+
+    plt.figure(figsize=(10, 5))
+    plt.semilogy(t, rmse_rk4 + 1e-30, "g-", lw=2.0, label="RK4 RMSE")
+    plt.semilogy(t, rmse_prk4 + 1e-30, "r-", lw=2.0, label="PRK4 RMSE")
+    plt.title("Global Error (Running RMSE across 4 states)")
+    plt.xlabel("t")
+    plt.ylabel("RMSE (log)")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    out = f"{prefix}_global_error.png"
+    plt.savefig(out, dpi=300)
+    print(f"Saved: {out}")
+def plot_phase_portraits_2x3(S, prefix="hyper4d"):
+    names = ["x", "y", "z", "w"]
+    pairs = [
+        (0, 1), (0, 2), (0, 3),
+        (1, 2), (1, 3), (2, 3)
+    ]
+
+    plt.figure(figsize=(14, 8))
+
+    for idx, (i, j) in enumerate(pairs, start=1):
+        plt.subplot(2, 3, idx)
+        plt.plot(S[:, i], S[:, j], lw=0.8)
+        plt.xlabel(names[i])
+        plt.ylabel(names[j])
+        plt.title(f"{names[i]}-{names[j]}")
+        plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out = f"{prefix}_phase_2x3.png"
+    plt.savefig(out, dpi=300)
+    plt.show()
+    print(f"Saved: {out}")
+
+def get_or_train_prk4_model(a, b, c, d, h, t_train, model_path, device=None, seed=0):
+    trainer = Trainer(a=a, b=b, c=c, d=d, h=h, t_max=t_train, device=device, seed=seed)
+
+    if model_path is not None and os.path.exists(model_path):
+        print(f"Loading existing PRK4 model: {model_path}")
+        trainer.load_model(model_path)
+        if not trainer.has_normalizer():
+            raise RuntimeError("Loaded model but mean/std missing in checkpoint.")
+        return trainer
+
+    print("No existing model found. Training a new one...")
+    trainer.train(epochs=3000, lr=5e-4)
+
+    if model_path is not None:
+        trainer.save_model(model_path)
+        print(f"Saved PRK4 model to: {model_path}")
+
+    return trainer
+
+
+# ===================== 7) Main =====================
+def main():
+    a, b, c, d = 36.0, 3.0, 20.0, 1.0
+    h = 1e-3
+    t_train = 8.0
+    t_final = 10.0
+    s0 = [1.0, 1.0, 1.0, 1.0]
+    model_path = "model_prk4_h0.001.pth"
+
+    trainer = get_or_train_prk4_model(
+        a=a, b=b, c=c, d=d,
+        h=h, t_train=t_train,
+        model_path=model_path,
+        seed=0
+    )
+
+    t, S_ref = reference_on_grid(a, b, c, d, s0, t_final, h)
+    _, S_rk4 = simulate_rk4_plain(a, b, c, d, s0, t_final, h)
+    _, S_prk4 = simulate_corrected(trainer, s0, t_final)
+    prefix = "rk4_pinn_hyper4d"
+    plot_phase_portraits_2x3(S_prk4, prefix=prefix + "_prk4")
+
+    err_rk4 = S_rk4 - S_ref
+    err_prk4 = S_prk4 - S_ref
+    abs_rk4 = np.abs(err_rk4)
+    abs_prk4 = np.abs(err_prk4)
+
+    t_targets = np.array([2.0, 4.0, 6.0, 8.0, 10.0], dtype=np.float64)
+    idx_targets = np.rint(t_targets / h).astype(int)
+
+    print("\nAbsolute errors at t = 2,4,6,8,10")
+    print("t | RK4(|ex|,|ey|,|ez|,|ew|) | PRK4(|ex|,|ey|,|ez|,|ew|)")
+    for tt, idx in zip(t_targets, idx_targets):
+        e_rk = abs_rk4[idx]
+        e_pr = abs_prk4[idx]
+        print(
+            f"{tt:>4.1f} | "
+            f"({e_rk[0]:.3e}, {e_rk[1]:.3e}, {e_rk[2]:.3e}, {e_rk[3]:.3e}) | "
+            f"({e_pr[0]:.3e}, {e_pr[1]:.3e}, {e_pr[2]:.3e}, {e_pr[3]:.3e})"
+        )
+
+    prefix = "rk4_pinn_hyper4d"
+    plot_state_series(t, S_ref, S_rk4, S_prk4, prefix=prefix)
+    plot_error_series(t, abs_rk4, abs_prk4, prefix=prefix)
+    plot_global_error(t, err_rk4, err_prk4, prefix=prefix)
+
+    print("\nFinal abs error at t_final:")
+    print("RK4 :", abs_rk4[-1])
+    print("PRK4:", abs_prk4[-1])
+
+
+if __name__ == "__main__":
+    main()

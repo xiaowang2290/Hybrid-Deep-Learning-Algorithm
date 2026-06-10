@@ -1,0 +1,441 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import warnings
+
+warnings.filterwarnings("ignore")
+plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
+
+torch.set_default_dtype(torch.float64)
+
+# ===================== 1) 4D Hyperchaotic ODE =====================
+def ode_rhs(t, s, a=36.0, b=3.0, c=20.0, d=1.0):
+    x, y, z, w = s
+    dx = a * (y - x) + w
+    dy = (c - a) * x - x * z + c * y
+    dz = x * y - b * z
+    dw = x * z - d * w
+    return np.array([dx, dy, dz, dw], dtype=np.float64)
+
+
+# ===================== 2) Integrators: Heun & RK4 =====================
+def rk4_step_vec(ti, si, h, a, b, c, d):
+    k1 = ode_rhs(ti, si, a, b, c, d)
+    k2 = ode_rhs(ti + 0.5 * h, si + 0.5 * h * k1, a, b, c, d)
+    k3 = ode_rhs(ti + 0.5 * h, si + 0.5 * h * k2, a, b, c, d)
+    k4 = ode_rhs(ti + h, si + h * k3, a, b, c, d)
+    s_rk4 = si + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+    return s_rk4, (k1, k2, k3, k4)
+
+
+def heun_step_vec(ti, si, h, a, b, c, d):
+    k1 = ode_rhs(ti, si, a, b, c, d)
+    k2 = ode_rhs(ti + h, si + h * k1, a, b, c, d)
+    s_heun = si + (h / 2.0) * (k1 + k2)
+    return s_heun, (k1, k2)
+
+
+# ===================== 3) Correction net =====================
+class CorrectionNet(nn.Module):
+    def __init__(self, input_dim, hidden_dim=256, depth=4, out_dim=4):
+        super().__init__()
+        layers = [nn.Linear(input_dim, hidden_dim), nn.GELU()]
+        for _ in range(depth - 1):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
+        layers += [nn.Linear(hidden_dim, out_dim)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ===================== 4) Trainer =====================
+class Trainer:
+    def __init__(self, method="pheun", a=36.0, b=3.0, c=20.0, d=1.0, h=1e-3, t_max=8.0, device=None, seed=0):
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        self.method = method.lower()
+        self.a, self.b, self.c, self.d = float(a), float(b), float(c), float(d)
+        self.h, self.t_max = float(h), float(t_max)
+        self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
+
+        input_dim = 15 if self.method == "pheun" else 23
+        self.model = CorrectionNet(input_dim=input_dim, hidden_dim=256, depth=4, out_dim=4).to(self.device).double()
+        self.mean = None
+        self.std = None
+
+    def _make_one_step_dataset(self, s0_list):
+        h = self.h
+        t_grid = np.arange(0.0, self.t_max + 1e-15, h)
+        inputs, targets = [], []
+
+        for s0 in s0_list:
+            S_traj = np.zeros((len(t_grid), 4), dtype=np.float64)
+            S_traj[0] = s0
+
+            for i in range(len(t_grid) - 1):
+                ti = t_grid[i]
+                si = S_traj[i]
+
+                if self.method == "pheun":
+                    s_h, (k1, k2) = heun_step_vec(ti, si, h, self.a, self.b, self.c, self.d)
+                    S_traj[i + 1] = s_h
+
+                    s_half_1, _ = heun_step_vec(ti, si, h / 2, self.a, self.b, self.c, self.d)
+                    s_h2, _ = heun_step_vec(ti + h / 2, s_half_1, h / 2, self.a, self.b, self.c, self.d)
+                    e_est = (s_h2 - s_h) / 3.0
+
+                    feat = np.concatenate([
+                        np.array([ti, ti + h], dtype=np.float64),
+                        si.astype(np.float64),
+                        k1.astype(np.float64),
+                        k2.astype(np.float64),
+                        np.array([h], dtype=np.float64)
+                    ], axis=0)
+                    target_val = e_est / (h ** 3)
+
+                else:
+                    s_h, (k1, k2, k3, k4) = rk4_step_vec(ti, si, h, self.a, self.b, self.c, self.d)
+                    S_traj[i + 1] = s_h
+
+                    s_half_1, _ = rk4_step_vec(ti, si, h / 2, self.a, self.b, self.c, self.d)
+                    s_h2, _ = rk4_step_vec(ti + h / 2, s_half_1, h / 2, self.a, self.b, self.c, self.d)
+                    e_est = (s_h2 - s_h) / 15.0
+
+                    feat = np.concatenate([
+                        np.array([ti, ti + h], dtype=np.float64),
+                        si.astype(np.float64),
+                        k1.astype(np.float64),
+                        k2.astype(np.float64),
+                        k3.astype(np.float64),
+                        k4.astype(np.float64),
+                        np.array([h], dtype=np.float64)
+                    ], axis=0)
+                    target_val = e_est / (h ** 5)
+
+                inputs.append(feat)
+                targets.append(target_val.astype(np.float64))
+
+        X = np.stack(inputs, axis=0)
+        Y = np.stack(targets, axis=0)
+
+        mean = X.mean(axis=0, keepdims=True)
+        std = X.std(axis=0, keepdims=True)
+        std[std == 0] = 1.0
+
+        self.mean = torch.tensor(mean, dtype=torch.float64, device=self.device)
+        self.std = torch.tensor(std, dtype=torch.float64, device=self.device)
+
+        X_t = torch.tensor(X, dtype=torch.float64, device=self.device)
+        Y_t = torch.tensor(Y, dtype=torch.float64, device=self.device)
+        Xn = (X_t - self.mean) / self.std
+        return Xn, Y_t
+
+    def train(self, epochs=3000, lr=5e-4):
+        base = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float64)
+        s0_list = [
+            base,
+            base * 0.5,
+            base * 1.5,
+            base + np.array([0.2, -0.1, 0.1, -0.2]),
+            base + np.array([-0.3, 0.2, -0.2, 0.3]),
+        ]
+
+        Xn, Y = self._make_one_step_dataset(s0_list)
+
+        opt = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-6)
+        sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+        loss_fn = nn.MSELoss()
+
+        self.model.train()
+        for ep in range(1, epochs + 1):
+            opt.zero_grad(set_to_none=True)
+            pred = self.model(Xn)
+            loss = loss_fn(pred, Y)
+            loss.backward()
+            opt.step()
+            sched.step()
+
+            if ep == 1 or ep % 500 == 0:
+                print(f"[{self.method.upper()} h={self.h}] Epoch {ep:4d} | Loss: {loss.item():.3e}")
+        return self
+
+    def save_model(self, path):
+        checkpoint = {
+            "model_state": self.model.state_dict(),
+            "mean": self.mean,
+            "std": self.std
+        }
+        torch.save(checkpoint, path)
+
+    def load_model(self, path):
+        checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state"])
+        self.mean = checkpoint["mean"].to(self.device)
+        self.std = checkpoint["std"].to(self.device)
+        self.model.eval()
+
+    @torch.no_grad()
+    def predict_N(self, feat_arr):
+        self.model.eval()
+        feat = torch.tensor(feat_arr, dtype=torch.float64, device=self.device).view(1, -1)
+        feat_n = (feat - self.mean) / self.std
+        out = self.model(feat_n).cpu().numpy().reshape(-1)
+        return out.astype(np.float64)
+
+
+# ===================== 5) Simulations =====================
+def simulate_corrected(trainer, s0, t_final):
+    a, b, c, d, h = trainer.a, trainer.b, trainer.c, trainer.d, trainer.h
+    t_grid = np.arange(0.0, t_final + 1e-15, h)
+    S = np.zeros((len(t_grid), 4), dtype=np.float64)
+    S[0] = np.array(s0, dtype=np.float64)
+
+    for i in range(len(t_grid) - 1):
+        ti = t_grid[i]
+        si = S[i]
+
+        if trainer.method == "pheun":
+            s_base, (k1, k2) = heun_step_vec(ti, si, h, a, b, c, d)
+            feat = np.concatenate([
+                np.array([ti, ti + h], dtype=np.float64),
+                si.astype(np.float64),
+                k1.astype(np.float64),
+                k2.astype(np.float64),
+                np.array([h], dtype=np.float64)
+            ], axis=0)
+            N_out = trainer.predict_N(feat)
+            S[i + 1] = s_base + N_out * (h ** 3)
+
+        else:
+            s_base, (k1, k2, k3, k4) = rk4_step_vec(ti, si, h, a, b, c, d)
+            feat = np.concatenate([
+                np.array([ti, ti + h], dtype=np.float64),
+                si.astype(np.float64),
+                k1.astype(np.float64),
+                k2.astype(np.float64),
+                k3.astype(np.float64),
+                k4.astype(np.float64),
+                np.array([h], dtype=np.float64)
+            ], axis=0)
+            N_out = trainer.predict_N(feat)
+            S[i + 1] = s_base + N_out * (h ** 5)
+
+    return t_grid, S
+
+
+def simulate_plain(method, s0, t_final, h, a=36.0, b=3.0, c=20.0, d=1.0):
+    method = method.lower()
+    t_grid = np.arange(0.0, t_final + 1e-15, h)
+    S = np.zeros((len(t_grid), 4), dtype=np.float64)
+    S[0] = np.array(s0, dtype=np.float64)
+
+    for i in range(len(t_grid) - 1):
+        ti = t_grid[i]
+        si = S[i]
+
+        if method == "heun":
+            S[i + 1], _ = heun_step_vec(ti, si, h, a, b, c, d)
+        elif method == "rk4":
+            S[i + 1], _ = rk4_step_vec(ti, si, h, a, b, c, d)
+        else:
+            raise ValueError("method must be 'heun' or 'rk4'")
+
+    return t_grid, S
+
+
+# ===================== 6) Train/load =====================
+def get_or_train_model(method, h, t_train):
+    save_path = f"model_{method}_h{h}.pth"
+    trainer = Trainer(method=method, h=h, t_max=t_train)
+    if os.path.exists(save_path):
+        print(f"Loading existing model: {save_path}")
+        trainer.load_model(save_path)
+    else:
+        print(f"Training new model: {save_path} ...")
+        trainer.train(epochs=3000, lr=5e-4)
+        trainer.save_model(save_path)
+    return trainer
+
+
+# ===================== 7) Posterior error =====================
+def posterior_error(S_h, S_h2):
+    """
+    事后估计误差定义为 |S_h - S_{h/2}|，
+    其中 S_{h/2} 已经对齐到 h 的时间网格。
+    """
+    return np.abs(S_h - S_h2)
+def compute_cme(pred, true):
+    pred = np.asarray(pred, dtype=np.float64)
+    true = np.asarray(true, dtype=np.float64)
+
+    sd_true = np.std(true)
+    if sd_true == 0:
+        sd_true = 1e-12
+
+    e_t = np.linalg.norm(pred - true, axis=1)
+    r_t = np.minimum(1.0, e_t / sd_true)
+    m_t = np.maximum.accumulate(r_t)
+    cme = np.mean(m_t)
+
+    return float(cme)
+
+
+def posterior_error(S_h, S_h2):
+    """
+    事后估计误差定义为 |S_h - S_{h/2}|，
+    其中 S_{h/2} 已经对齐到 h 的时间网格。
+    """
+    return np.abs(S_h - S_h2)
+
+
+def compute_error_metrics(err, S_h, S_h2_aligned):
+    """
+    err: shape (N, 4), 事后估计误差数组
+    S_h, S_h2_aligned: 两条对齐轨迹，用于计算 CME
+    """
+    metrics = {
+        "max error": float(np.max(err)),
+        "mean error": float(np.mean(err)),
+        "L2 error": float(np.linalg.norm(err)),
+        "CME": float(compute_cme(S_h, S_h2_aligned))
+    }
+    return metrics
+
+
+def print_error_metrics(method_name, metrics):
+    print(f"\n===== {method_name} =====")
+    print(f"max error : {metrics['max error']:.6e}")
+    print(f"mean error: {metrics['mean error']:.6e}")
+    print(f"L2 error  : {metrics['L2 error']:.6e}")
+    print(f"CME       : {metrics['CME']:.6e}")
+
+
+# ===================== 8) Plot helper =====================
+def plot_compare_errors(t, err1, err2, label1, label2, title_all, save_name):
+    names = ["x", "y", "z", "w"]
+    plt.figure(figsize=(14, 10))
+
+    for i in range(4):
+        plt.subplot(2, 2, i + 1)
+        plt.semilogy(t, err1[:, i] + 1e-30, lw=1.5, label=label1)
+        plt.semilogy(t, err2[:, i] + 1e-30, lw=1.5, label=label2)
+        plt.title(f"{title_all} - {names[i]}")
+        plt.xlabel("t")
+        plt.ylabel("A Posteriori Error (log)")
+        plt.grid(True, which="both", alpha=0.3)
+        plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(save_name, dpi=300)
+    print(f"Plot saved to '{save_name}'")
+
+
+# ===================== 9) Main =====================
+def main():
+    t_train = 8.0
+    t_final = 10.0
+    s0 = [1.0, 1.0, 1.0, 1.0]
+
+    # ---------- 1. 准备修正模型 ----------
+    print("--- Setup for h=0.001 ---")
+    pheun_h1 = get_or_train_model("pheun", 0.001, t_train)
+    prk4_h1 = get_or_train_model("prk4", 0.001, t_train)
+
+    print("\n--- Setup for h=0.0005 ---")
+    pheun_h2 = get_or_train_model("pheun", 0.0005, t_train)
+    prk4_h2 = get_or_train_model("prk4", 0.0005, t_train)
+
+    # ---------- 2. 计算 PHeun / PRK4 数值解 ----------
+    print("\nSimulating corrected trajectories...")
+    t_h1, S_pheun_h1 = simulate_corrected(pheun_h1, s0, t_final)
+    _,    S_prk4_h1  = simulate_corrected(prk4_h1, s0, t_final)
+
+    t_h2, S_pheun_h2 = simulate_corrected(pheun_h2, s0, t_final)
+    _,    S_prk4_h2  = simulate_corrected(prk4_h2, s0, t_final)
+
+    # ---------- 3. 计算纯 Heun / RK4 数值解 ----------
+    print("Simulating plain Heun/RK4 trajectories...")
+    _, S_heun_h1 = simulate_plain("heun", s0, t_final, 0.001)
+    _, S_rk4_h1  = simulate_plain("rk4",  s0, t_final, 0.001)
+
+    _, S_heun_h2 = simulate_plain("heun", s0, t_final, 0.0005)
+    _, S_rk4_h2  = simulate_plain("rk4",  s0, t_final, 0.0005)
+
+    # ---------- 4. 对齐 h=0.0005 到 h=0.001 网格 ----------
+    S_pheun_h2_aligned = S_pheun_h2[::2]
+    S_prk4_h2_aligned  = S_prk4_h2[::2]
+    S_heun_h2_aligned  = S_heun_h2[::2]
+    S_rk4_h2_aligned   = S_rk4_h2[::2]
+
+    # 安全检查
+    min_len = min(len(S_pheun_h1), len(S_pheun_h2_aligned), len(S_prk4_h1), len(S_prk4_h2_aligned),
+                  len(S_heun_h1), len(S_heun_h2_aligned), len(S_rk4_h1), len(S_rk4_h2_aligned))
+    t_h1 = t_h1[:min_len]
+
+    S_pheun_h1 = S_pheun_h1[:min_len]
+    S_pheun_h2_aligned = S_pheun_h2_aligned[:min_len]
+
+    S_prk4_h1 = S_prk4_h1[:min_len]
+    S_prk4_h2_aligned = S_prk4_h2_aligned[:min_len]
+
+    S_heun_h1 = S_heun_h1[:min_len]
+    S_heun_h2_aligned = S_heun_h2_aligned[:min_len]
+
+    S_rk4_h1 = S_rk4_h1[:min_len]
+    S_rk4_h2_aligned = S_rk4_h2_aligned[:min_len]
+
+    # ---------- 5. 定义各方法的事后估计误差 ----------
+    err_pheun = posterior_error(S_pheun_h1, S_pheun_h2_aligned)
+    err_heun  = posterior_error(S_heun_h1,  S_heun_h2_aligned)
+    err_prk4  = posterior_error(S_prk4_h1,  S_prk4_h2_aligned)
+    err_rk4   = posterior_error(S_rk4_h1,   S_rk4_h2_aligned)
+    # ---------- 5.1 输出几种方法的误差统计 ----------
+    metrics_pheun = compute_error_metrics(err_pheun, S_pheun_h1, S_pheun_h2_aligned)
+    metrics_heun  = compute_error_metrics(err_heun,  S_heun_h1,  S_heun_h2_aligned)
+    metrics_prk4  = compute_error_metrics(err_prk4,  S_prk4_h1,  S_prk4_h2_aligned)
+    metrics_rk4   = compute_error_metrics(err_rk4,   S_rk4_h1,   S_rk4_h2_aligned)
+
+    print("\n=========== A Posteriori Error Metrics ===========")
+    print_error_metrics("PHeun", metrics_pheun)
+    print_error_metrics("Heun",  metrics_heun)
+    print_error_metrics("PRK4",  metrics_prk4)
+    print_error_metrics("RK4",   metrics_rk4)
+
+    # ---------- 6. 绘图 ----------
+    # 图1：PHeun vs Heun 事后估计误差
+    plot_compare_errors(
+        t_h1, err_pheun, err_heun,
+        label1="PHeun a posteriori error",
+        label2="Heun a posteriori error",
+        title_all="PHeun vs Heun A Posteriori Error",
+        save_name="compare_pheun_heun_aposteriori.png"
+    )
+
+    # 图2：PRK4 vs RK4 事后估计误差
+    plot_compare_errors(
+        t_h1, err_prk4, err_rk4,
+        label1="PRK4 a posteriori error",
+        label2="RK4 a posteriori error",
+        title_all="PRK4 vs RK4 A Posteriori Error",
+        save_name="compare_prk4_rk4_aposteriori.png"
+    )
+
+    # 图3：PHeun vs PRK4 事后估计误差
+    plot_compare_errors(
+        t_h1, err_pheun, err_prk4,
+        label1="PHeun a posteriori error",
+        label2="PRK4 a posteriori error",
+        title_all="PHeun vs PRK4 A Posteriori Error",
+        save_name="compare_pheun_prk4_aposteriori.png"
+    )
+
+    print("\nDone!")
+
+
+if __name__ == "__main__":
+    main()
